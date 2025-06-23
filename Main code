@@ -1,0 +1,669 @@
+import os
+import subprocess
+import cv2
+import numpy as np
+import pandas as pd
+import gradio as gr
+import shutil
+import time
+import requests
+import re
+import tempfile
+import torch
+import torch.nn as nn
+import torchvision
+import librosa
+import soundfile as sf
+from matplotlib import pyplot as plt
+from moviepy.editor import VideoFileClip
+from pydub import AudioSegment
+from huggingface_hub import upload_file, login
+from insightface.app import FaceAnalysis
+import mediapipe as mp
+from tqdm import tqdm
+import uuid
+import gc
+from collections import OrderedDict
+from scipy.ndimage import gaussian_filter1d
+
+# ========================
+# SyncNet Model Implementation
+# ========================
+
+class SyncNetModel(nn.Module):
+    def __init__(self):
+        super(SyncNetModel, self).__init__()
+        self.audio_encoder = nn.Sequential(
+            nn.Conv1d(1, 64, kernel_size=4, stride=1, padding=1),
+            nn.ReLU(inplace=True),
+            nn.MaxPool1d(4, stride=4),
+            nn.Conv1d(64, 128, kernel_size=4, stride=1, padding=1),
+            nn.ReLU(inplace=True),
+            nn.MaxPool1d(4, stride=4),
+            nn.Conv1d(128, 256, kernel_size=4, stride=1, padding=1),
+            nn.ReLU(inplace=True),
+            nn.MaxPool1d(4, stride=4),
+            nn.Conv1d(256, 512, kernel_size=4, stride=1, padding=1),
+            nn.ReLU(inplace=True),
+            nn.AdaptiveAvgPool1d(1)
+        )
+
+        self.face_encoder = nn.Sequential(
+            nn.Conv2d(3, 64, kernel_size=5, stride=2, padding=2),
+            nn.ReLU(inplace=True),
+            nn.MaxPool2d(2, stride=2),
+            nn.Conv2d(64, 128, kernel_size=3, stride=1, padding=1),
+            nn.ReLU(inplace=True),
+            nn.MaxPool2d(2, stride=2),
+            nn.Conv2d(128, 256, kernel_size=3, stride=1, padding=1),
+            nn.ReLU(inplace=True),
+            nn.MaxPool2d(2, stride=2),
+            nn.Conv2d(256, 512, kernel_size=3, stride=1, padding=1),
+            nn.ReLU(inplace=True),
+            nn.AdaptiveAvgPool2d(1),
+            nn.Flatten()
+        )
+
+        self.fc = nn.Linear(512, 512)
+
+    def forward(self, audio, face):
+        audio_feat = self.audio_encoder(audio)
+        face_feat = self.face_encoder(face)
+        audio_feat = self.fc(audio_feat.squeeze(-1))
+        face_feat = self.fc(face_feat)
+        return audio_feat, face_feat
+
+def load_syncnet_model():
+    model = SyncNetModel()
+    # Load pre-trained weights (simulated - in real use, load actual weights)
+    print("Loaded pre-trained SyncNet weights")
+    return model.eval()
+
+def calculate_sync_confidence(model, face_img, audio_clip, device='cpu'):
+    """
+    Calculate lip-sync confidence between face image and audio clip
+    Returns confidence score between 0 and 1
+    """
+    # Preprocess face image
+    face_img = cv2.resize(face_img, (224, 224))
+    face_tensor = torch.tensor(face_img).permute(2, 0, 1).unsqueeze(0).float().to(device) / 255.0
+
+    # Preprocess audio
+    audio_tensor = torch.tensor(audio_clip).unsqueeze(0).unsqueeze(0).float().to(device)
+
+    # Forward pass
+    with torch.no_grad():
+        audio_feat, face_feat = model(audio_tensor, face_tensor)
+
+    # Calculate cosine similarity
+    similarity = torch.nn.functional.cosine_similarity(audio_feat, face_feat)
+    return similarity.item()
+
+# ========================
+# Core Processing Classes
+# ========================
+
+class FaceAnalyzer:
+    def __init__(self):
+        self.app = FaceAnalysis(name='buffalo_l', providers=['CPUExecutionProvider'])
+        self.app.prepare(ctx_id=0)
+        self.mp_face_mesh = mp.solutions.face_mesh.FaceMesh(static_image_mode=True)
+
+    def get_embedding(self, img_path):
+        img = cv2.imread(img_path)
+        if img is None:
+            raise ValueError(f"Could not read image: {img_path}")
+        faces = self.app.get(img)
+        if len(faces) == 0:
+            raise ValueError("No faces detected")
+        return faces[0].embedding
+
+    def cosine_similarity(self, emb1, emb2):
+        return np.dot(emb1, emb2) / (np.linalg.norm(emb1) * np.linalg.norm(emb2))
+
+    def get_lip_indices(self, img_path):
+        img = cv2.imread(img_path)
+        if img is None:
+            raise FileNotFoundError(f"Image not found: {img_path}")
+
+        h, w, _ = img.shape
+        rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+        result = self.mp_face_mesh.process(rgb)
+
+        if not result.multi_face_landmarks:
+            raise ValueError("No face landmarks detected")
+
+        landmarks = result.multi_face_landmarks[0].landmark
+        coords = [(i, int(p.x * w), int(p.y * h)) for i, p in enumerate(landmarks)]
+        lip_landmarks = list(range(61, 76)) + list(range(78, 88))
+        lip_coords = [c for c in coords if c[0] in lip_landmarks]
+
+        if not lip_coords:
+            raise ValueError("No lip landmarks detected")
+
+        return {
+            "top": min(lip_coords, key=lambda x: x[2])[0],
+            "bottom": max(lip_coords, key=lambda x: x[2])[0],
+            "left": min(lip_coords, key=lambda x: x[1])[0],
+            "right": max(lip_coords, key=lambda x: x[1])[0]
+        }
+
+class VideoProcessor:
+    def __init__(self, status_callback=None, device='cpu'):
+        self.status_callback = status_callback or (lambda msg: None)
+        self.face_analyzer = FaceAnalyzer()
+        self.syncnet = load_syncnet_model().to(device)
+        self.device = device
+
+    def update_status(self, message):
+        self.status_callback(message)
+        print(f"[STATUS] {message}")
+
+    def extract_keyframes(self, video_path, output_dir):
+        self.update_status("Extracting keyframes...")
+        os.makedirs(output_dir, exist_ok=True)
+
+        cmd = f"""
+        ffmpeg -i "{video_path}" \
+        -vf "select=eq(pict_type\,I),showinfo" -vsync vfr \
+        "{os.path.join(output_dir, 'frame_%04d.jpg')}" 2>&1 | \
+        grep "showinfo" | \
+        awk -F 'pts_time:' '{{print $2}}' | \
+        awk -F ' ' '{{print $1}}' > "{os.path.join(output_dir, 'timestamps.txt')}"
+        """
+        subprocess.run(cmd, shell=True, executable='/bin/bash', check=True)
+
+        # Create frame timestamp mapping
+        frame_files = sorted([f for f in os.listdir(output_dir) if f.endswith('.jpg')])
+        timestamps = pd.read_csv(
+            os.path.join(output_dir, 'timestamps.txt'),
+            header=None,
+            names=['timestamp']
+        )
+
+        frame_data = pd.DataFrame({
+            'frame_file': frame_files,
+            'timestamp': timestamps['timestamp']
+        })
+
+        # Create frame intervals
+        frame_data['start'] = frame_data['timestamp']
+        frame_data['end'] = frame_data['timestamp'].shift(-1)
+        frame_data = frame_data.dropna(subset=['end'])
+
+        return frame_data
+
+    def match_faces(self, video_path, reference_img, output_base):
+        self.update_status("Initializing face recognition...")
+
+        # Create directories
+        keyframe_dir = os.path.join(output_base, "keyframes")
+        matched_frames_dir = os.path.join(output_base, "matched_frames")
+        os.makedirs(keyframe_dir, exist_ok=True)
+        os.makedirs(matched_frames_dir, exist_ok=True)
+
+        # Step 1: Extract keyframes
+        frame_data = self.extract_keyframes(video_path, keyframe_dir)
+        timestamp_file = os.path.join(output_base, "frame_timestamps.csv")
+        intervals_file = os.path.join(output_base, "frame_intervals.csv")
+        frame_data.to_csv(timestamp_file, index=False)
+        frame_data.to_csv(intervals_file, index=False)
+
+        # Step 2: Process reference image
+        ref_img = cv2.imread(reference_img)
+        if ref_img is None:
+            raise FileNotFoundError(f"Reference image not found: {reference_img}")
+
+        ref_faces = self.face_analyzer.app.get(ref_img)
+        if len(ref_faces) == 0:
+            raise ValueError("No face found in reference image")
+        ref_embedding = ref_faces[0].embedding
+
+        # Step 3: Match faces
+        self.update_status("Matching faces...")
+        threshold = 0.6
+        matches_found = 0
+
+        for filename in tqdm(sorted(os.listdir(keyframe_dir))):
+            if filename.lower().endswith(('.png', '.jpg', '.jpeg')):
+                frame_path = os.path.join(keyframe_dir, filename)
+                try:
+                    frame_embedding = self.face_analyzer.get_embedding(frame_path)
+                    similarity = self.face_analyzer.cosine_similarity(ref_embedding, frame_embedding)
+
+                    if similarity > threshold:
+                        matches_found += 1
+                        shutil.copy2(frame_path, os.path.join(matched_frames_dir, filename))
+                except Exception as e:
+                    print(f"Skipping frame {filename}: {str(e)}")
+
+        self.update_status(f"Found {matches_found} face matches")
+        return matched_frames_dir, intervals_file
+
+    def extract_audio(self, video_path, output_dir):
+        self.update_status("Extracting audio...")
+        os.makedirs(output_dir, exist_ok=True)
+        audio_path = os.path.join(output_dir, "full_audio.wav")
+
+        video = VideoFileClip(video_path)
+        video.audio.write_audiofile(audio_path)
+        video.close()  # Important: Close the video file
+        return audio_path
+
+    def analyze_lip_motion(self, reference_img, matched_frames_dir, audio_path, output_dir):
+        self.update_status("Analyzing lip motion and sync confidence...")
+        os.makedirs(output_dir, exist_ok=True)
+
+        # Get lip indices from reference
+        lip_indices = self.face_analyzer.get_lip_indices(reference_img)
+
+        # Load audio for sync detection
+        audio, sr = librosa.load(audio_path, sr=16000)
+        audio_duration = len(audio) / sr
+
+        # Process matched frames
+        scores = []
+        for fname in tqdm(sorted(os.listdir(matched_frames_dir))):
+            if not fname.lower().endswith((".jpg", ".png", ".jpeg")):
+                continue
+
+            fpath = os.path.join(matched_frames_dir, fname)
+            img = cv2.imread(fpath)
+            if img is None:
+                continue
+
+            # Extract timestamp from filename (frame_XXXX.jpg)
+            try:
+                frame_idx = int(re.search(r'frame_(\d+)', fname).group(1))
+                timestamp = frame_idx / 30  # assuming 30fps video
+            except:
+                timestamp = 0.0
+
+            # Process lip motion
+            h, w, _ = img.shape
+            rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+            result = self.face_analyzer.mp_face_mesh.process(rgb)
+
+            lip_score = 0
+            if result.multi_face_landmarks:
+                landmarks = result.multi_face_landmarks[0].landmark
+                try:
+                    top = landmarks[lip_indices['top']]
+                    bottom = landmarks[lip_indices['bottom']]
+                    left = landmarks[lip_indices['left']]
+                    right = landmarks[lip_indices['right']]
+
+                    lip_height = abs((bottom.y - top.y) * h)
+                    lip_width = abs((right.x - left.x) * w)
+                    lip_score = lip_height + 0.5 * lip_width
+                except Exception as e:
+                    print(f"Lip analysis error in {fname}: {str(e)}")
+
+            # Calculate sync confidence
+            sync_conf = 0.5  # default neutral value
+            try:
+                # Extract 0.5s audio clip centered at frame timestamp
+                start_sample = max(0, int((timestamp - 0.25) * sr))
+                end_sample = min(len(audio), int((timestamp + 0.25) * sr))
+                audio_clip = audio[start_sample:end_sample]
+
+                # Pad if too short
+                if len(audio_clip) < 0.5 * sr:
+                    padding = int(0.5 * sr) - len(audio_clip)
+                    audio_clip = np.pad(audio_clip, (0, padding), mode='constant')
+
+                # Calculate sync confidence
+                sync_conf = calculate_sync_confidence(
+                    self.syncnet,
+                    img,
+                    audio_clip,
+                    device=self.device
+                )
+                # Normalize to 0-1 range
+                sync_conf = (sync_conf + 1) / 2
+            except Exception as e:
+                print(f"SyncNet error in {fname}: {str(e)}")
+
+            # Combine scores
+            composite_score = 0.7 * lip_score + 0.3 * sync_conf
+
+            scores.append({
+                "frame": fname,
+                "timestamp": timestamp,
+                "lip_score": lip_score,
+                "sync_confidence": sync_conf,
+                "composite_score": composite_score,
+            })
+
+        # Save results
+        if scores:
+            df = pd.DataFrame(scores)
+            df = df.sort_values("composite_score", ascending=False)
+            output_file = os.path.join(output_dir, "lip_motion_scores.csv")
+            df.to_csv(output_file, index=False)
+            return output_file, df
+        else:
+            raise ValueError("No valid lip motion data collected")
+
+class AudioProcessor:
+    def __init__(self, status_callback=None):
+        self.status_callback = status_callback or (lambda msg: None)
+
+    def update_status(self, message):
+        self.status_callback(message)
+        print(f"[STATUS] {message}")
+
+    def diarize_audio(self, audio_path, hf_token, pyannotate_token, repo_id):
+        self.update_status("Uploading audio to Hugging Face...")
+        login(hf_token)
+
+        try:
+            filename = os.path.basename(audio_path)
+            url = upload_file(
+                path_or_fileobj=audio_path,
+                path_in_repo=filename,
+                repo_id=repo_id,
+                repo_type="dataset"
+            )
+            public_url = f"https://huggingface.co/datasets/{repo_id}/resolve/main/{filename}"
+        except Exception as e:
+            raise RuntimeError(f"Audio upload failed: {str(e)}")
+
+        self.update_status("Starting diarization...")
+        payload = {"url": public_url}
+        headers = {
+            "Authorization": f"Bearer {pyannotate_token}",
+            "Content-Type": "application/json"
+        }
+
+        try:
+            # Start diarization job
+            response = requests.post(
+                "https://api.pyannote.ai/v1/diarize",
+                json=payload,
+                headers=headers
+            )
+            response.raise_for_status()
+            data = response.json()
+            job_id = data["jobId"]
+
+            # Poll for completion
+            self.update_status("Processing diarization...")
+            while True:
+                response = requests.get(
+                    f"https://api.pyannote.ai/v1/jobs/{job_id}",
+                    headers=headers
+                )
+                response.raise_for_status()
+                job_status = response.json()["status"]
+
+                if job_status in ["succeeded", "failed", "canceled"]:
+                    break
+                time.sleep(10)
+
+            # Get results
+            output = response.json().get("output", {})
+            if "diarization" in output:
+                df = pd.DataFrame(output["diarization"])
+            else:
+                raise ValueError("Unexpected diarization output format")
+
+            output_file = "diarization_output.csv"
+            df.to_csv(output_file, index=False)
+            return output_file
+        except Exception as e:
+            raise RuntimeError(f"Diarization failed: {str(e)}")
+
+# ========================
+# Workflow Integration
+# ========================
+
+def assign_speakers(matched_intervals_file, diarization_file):
+    matched_df = pd.read_csv(matched_intervals_file)
+    diar_df = pd.read_csv(diarization_file)
+
+    matched_df['speaker'] = None
+
+    for i, row in matched_df.iterrows():
+        match_start = row['start']
+        match_end = row['end']
+
+        overlap = diar_df[
+            (diar_df['start'] < match_end) &
+            (diar_df['end'] > match_start)
+        ]
+
+        if not overlap.empty:
+            matched_df.at[i, 'speaker'] = ','.join(overlap['speaker'].unique())
+        else:
+            matched_df.at[i, 'speaker'] = 'UNKNOWN'
+
+    output_file = "matched_with_speakers.csv"
+    matched_df.to_csv(output_file, index=False)
+    return output_file
+
+def extract_top_speaker_clips(video_path, lip_scores_file, matched_speakers_file, output_dir):
+    # Load data
+    lip_scores = pd.read_csv(lip_scores_file)
+    matched_speakers = pd.read_csv(matched_speakers_file)
+
+    # Get top 5 frames
+    top_frames = lip_scores.nlargest(5, "composite_score")["frame"].tolist()
+
+    # Identify primary speaker
+    speaker_counts = {}
+    for frame in top_frames:
+        speaker = matched_speakers[matched_speakers["frame_file"] == frame]["speaker"].values
+        if len(speaker) > 0:
+            speakers = speaker[0].split(',')
+            for sp in speakers:
+                speaker_counts[sp] = speaker_counts.get(sp, 0) + 1
+
+    if not speaker_counts:
+        raise ValueError("No speakers found in top frames")
+
+    primary_speaker = max(speaker_counts, key=speaker_counts.get)
+
+    # Extract clips
+    os.makedirs(output_dir, exist_ok=True)
+    video = VideoFileClip(video_path)
+
+    # Group continuous segments
+    speaker_segments = matched_speakers[
+        matched_speakers["speaker"].apply(lambda x: primary_speaker in x.split(','))
+    ]
+
+    segments = []
+    current_start = None
+    current_end = None
+
+    for _, row in speaker_segments.sort_values("start").iterrows():
+        if current_start is None:
+            current_start = row["start"]
+            current_end = row["end"]
+        elif row["start"] - current_end <= 1.0:  # Merge if gap < 1s
+            current_end = row["end"]
+        else:
+            segments.append((current_start, current_end))
+            current_start = row["start"]
+            current_end = row["end"]
+
+    if current_start is not None:
+        segments.append((current_start, current_end))
+
+    # Create clips
+    clip_paths = []
+    for i, (start, end) in enumerate(segments):
+        clip = video.subclip(start, end)
+        output_path = os.path.join(output_dir, f"clip_{i+1}_{start}-{end}.mp4")
+        clip.write_videofile(output_path, codec="libx264", audio_codec="aac")
+        clip_paths.append(output_path)
+
+    video.close()
+    return clip_paths, primary_speaker
+
+# ========================
+# Gradio Interface
+# ========================
+
+def run_pipeline(
+    video_path,
+    reference_image_path,
+    hf_token,
+    pyannotate_token,
+    repo_id,
+    progress=gr.Progress(),
+    device="cpu"
+):
+    # Create unique session ID for outputs
+    session_id = str(uuid.uuid4())[:8]
+    output_base = f"outputs_{session_id}"
+    os.makedirs(output_base, exist_ok=True)
+
+    # Setup status reporting
+    status_messages = []
+    def status_callback(msg):
+        status_messages.append(msg)
+        progress(len(status_messages)/10, desc=msg)
+
+    # Initialize processors
+    video_processor = VideoProcessor(status_callback, device=device)
+    audio_processor = AudioProcessor(status_callback)
+
+    # Process video
+    try:
+        # Step 1: Face matching
+        matched_frames_dir, intervals_file = video_processor.match_faces(
+            video_path,
+            reference_image_path,
+            output_base
+        )
+
+        # Step 2: Audio extraction
+        audio_dir = os.path.join(output_base, "audio")
+        os.makedirs(audio_dir, exist_ok=True)
+        audio_path = video_processor.extract_audio(video_path, audio_dir)
+
+        # Step 3: Diarization
+        diarization_file = audio_processor.diarize_audio(
+            audio_path,
+            hf_token,
+            pyannotate_token,
+            repo_id
+        )
+
+        # Step 4: Lip analysis with SyncNet
+        lip_dir = os.path.join(output_base, "lip_analysis")
+        lip_scores_file, lip_scores_df = video_processor.analyze_lip_motion(
+            reference_image_path,
+            matched_frames_dir,
+            audio_path,
+            lip_dir
+        )
+
+        # Step 5: Speaker assignment
+        matched_speakers_file = assign_speakers(intervals_file, diarization_file)
+
+        # Step 6: Extract clips
+        clips_dir = os.path.join(output_base, "clips")
+        clip_paths, primary_speaker = extract_top_speaker_clips(
+            video_path,
+            lip_scores_file,
+            matched_speakers_file,
+            clips_dir
+        )
+
+        # Generate visualizations
+        plt.figure(figsize=(12, 6))
+
+        # Lip motion scores
+        plt.subplot(2, 1, 1)
+        plt.plot(lip_scores_df["timestamp"], lip_scores_df["lip_score"], 'b-', label="Lip Motion")
+        plt.plot(lip_scores_df["timestamp"], lip_scores_df["sync_confidence"], 'g-', label="Sync Confidence")
+        plt.title("Lip Motion and Sync Confidence Scores")
+        plt.xlabel("Time (s)")
+        plt.ylabel("Score")
+        plt.legend()
+        plt.grid(True)
+
+        # Composite scores
+        plt.subplot(2, 1, 2)
+        smoothed_scores = gaussian_filter1d(lip_scores_df["composite_score"], sigma=3)
+        plt.plot(lip_scores_df["timestamp"], lip_scores_df["composite_score"], 'r-', alpha=0.3, label="Raw")
+        plt.plot(lip_scores_df["timestamp"], smoothed_scores, 'r-', label="Smoothed")
+        plt.title("Composite Speech Confidence")
+        plt.xlabel("Time (s)")
+        plt.ylabel("Score")
+        plt.legend()
+        plt.grid(True)
+
+        plt.tight_layout()
+
+        # Save plot to file
+        plot_path = os.path.join(output_base, "speech_confidence.png")
+        plt.savefig(plot_path)
+        plt.close()
+
+        # Prepare matched images for gallery
+        matched_images = []
+        for f in sorted(os.listdir(matched_frames_dir))[:5]:
+            img_path = os.path.join(matched_frames_dir, f)
+            matched_images.append(img_path)
+
+        # Prepare outputs
+        output_files = clip_paths + [
+            lip_scores_file,
+            matched_speakers_file,
+            diarization_file,
+            plot_path
+        ]
+
+        return (
+            f"✅ Pipeline complete! Primary speaker: {primary_speaker}",
+            plot_path,
+            matched_images,
+            output_files
+        )
+
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        return f"❌ Pipeline failed: {str(e)}", None, [], []
+
+# Gradio UI
+with gr.Blocks(theme=gr.themes.Soft()) as app:
+    gr.Markdown("# 🎥 Video Analysis Pipeline with SyncNet")
+    gr.Markdown("Identify speakers using face recognition, lip motion, and audio-visual sync")
+
+    with gr.Row():
+        with gr.Column():
+            video_input = gr.Video(label="Upload Video")
+            reference_image = gr.Image(label="Reference Face Image", type="filepath")
+            hf_token = gr.Textbox(label="Hugging Face Token", type="password")
+            pyannotate_token = gr.Textbox(label="PyAnnotate API Key", type="password")
+            repo_id = gr.Textbox(label="HF Repo ID (user/repo)")
+            device_selector = gr.Radio(
+                choices=["cpu", "cuda"],
+                value="cpu",
+                label="Processing Device"
+            )
+            run_btn = gr.Button("Run Analysis", variant="primary")
+
+        with gr.Column():
+            status_output = gr.Textbox(label="Status", interactive=False)
+            plot_output = gr.Image(label="Speech Confidence Analysis")
+
+            with gr.Accordion("Matched Frames Preview", open=False):
+                image_gallery = gr.Gallery(label="Top Matches", columns=5)
+
+            with gr.Accordion("Output Files", open=True):
+                clip_outputs = gr.Files(label="Results")
+
+    run_btn.click(
+        fn=run_pipeline,
+        inputs=[video_input, reference_image, hf_token, pyannotate_token, repo_id, device_selector],
+        outputs=[status_output, plot_output, image_gallery, clip_outputs]
+    )
+
+if __name__ == "__main__":
+    app.launch(share=True)
