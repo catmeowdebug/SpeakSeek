@@ -1,8 +1,8 @@
 # 🎥 Video Speaker Analysis Pipeline
 
 ![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)
-![Issues](https://img.shields.io/github/issues/SpeakSeek/video-speaker-analysis-pipeline)
-![Stars](https://img.shields.io/github/stars/SpeakSeek/video-speaker-analysis-pipeline?style=social)
+![Issues](https://img.shields.io/github/issues/catmeowdebug/video-speaker-analysis-pipeline)
+![Stars](https://img.shields.io/github/stars/catmeowdebug/video-speaker-analysis-pipeline?style=social)
 ![Python](https://img.shields.io/badge/python-3.8+-blue.svg)
 ![PyTorch](https://img.shields.io/badge/PyTorch-2.0+-orange.svg)
 ![Gradio](https://img.shields.io/badge/Gradio-4.0+-green.svg)
