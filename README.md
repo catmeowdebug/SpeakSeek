@@ -287,10 +287,7 @@ This project is licensed under the MIT License - see the [LICENSE](LICENSE) file
 - [pyannote.audio: Neural Speech Processing](https://arxiv.org/abs/1911.01255)
 
 ## 🔗 Links
-
-- [Demo Video](https://youtu.be/your-demo-video)
-- [Documentation](https://your-docs-site.com)
-- [Issues](https://github.com/yourusername/video-speaker-analysis-pipeline/issues)
+- [Issues](https://github.com/catmeowdebug/video-speaker-analysis-pipeline/issues)
 
 ## 📊 Performance Benchmarks
 
