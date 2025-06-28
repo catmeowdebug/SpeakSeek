@@ -1,5 +1,5 @@
 
-## Video Speaker Analysis Pipeline
+##  SpeakSeek
 
 ![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)
 ![Issues](https://img.shields.io/github/issues/catmeowdebug/SpeakSeek)
