@@ -287,7 +287,7 @@ This project is licensed under the MIT License - see the [LICENSE](LICENSE) file
 - [pyannote.audio: Neural Speech Processing](https://arxiv.org/abs/1911.01255)
 
 ## 🔗 Links
-- [Issues](https://github.com/catmeowdebug/video-speaker-analysis-pipeline/issues)
+- [Issues](https://github.com/catmeowdebug/SpeakSeek/issues)
 
 ## 📊 Performance Benchmarks
 
