@@ -25,6 +25,7 @@ import uuid
 import gc
 from collections import OrderedDict
 from scipy.ndimage import gaussian_filter1d
+from faster_whisper import WhisperModel
 
 # ========================
 # SyncNet Model Implementation
@@ -415,6 +416,77 @@ class AudioProcessor:
             raise RuntimeError(f"Diarization failed: {str(e)}")
 
 # ========================
+# Transcription and Chat Functions
+# ========================
+
+def transcribe_clips(clip_paths, output_dir, model_size="base", device="cpu"):
+    """Transcribe all video clips using faster-whisper"""
+    os.makedirs(output_dir, exist_ok=True)
+    model = WhisperModel(model_size, device=device, compute_type="int8")
+
+    transcripts = {}
+    for clip_path in clip_paths:
+        if clip_path.endswith((".mp3", ".wav", ".mp4")):
+            segments, _ = model.transcribe(clip_path)
+            transcript = " ".join(segment.text for segment in segments)
+
+            file_name = os.path.basename(clip_path)
+            output_path = os.path.join(output_dir, f"{file_name}.txt")
+
+            with open(output_path, "w", encoding="utf-8") as f:
+                f.write(transcript)
+
+            transcripts[clip_path] = transcript
+            print(f"Transcribed: {file_name}")
+
+    return transcripts
+
+def ask_question(transcripts, question, hf_token, model_name="NousResearch/Hermes-3-Llama-3.1-8B"):
+    """Use Hugging Face API to answer questions about the transcripts"""
+    # Combine all transcripts with clip identifiers
+    combined_text = ""
+    for clip_path, transcript in transcripts.items():
+        clip_name = os.path.basename(clip_path)
+        combined_text += f"\n\nClip: {clip_name}\nTranscript:\n{transcript}"
+
+    # Compose prompt with system instruction
+    system_prompt = (
+        "You are an analyser that receives transcripts of video clips where speakers are talking.\n"
+        "You can answer questions like:\n"
+        "- What did the speaker say in clip X about topic Y?\n"
+        "- Where did the speaker talk about deadlines or specific topics?\n"
+        "- What is the speaker's opinion or mood in the clips?\n"
+        "- Which clip contains discussion about X?\n"
+        "Always mention which clip(s) contain the relevant information."
+    )
+
+    full_prompt = f"""<|system|>\n{system_prompt}</s>\n<|user|>\nTranscripts:{combined_text}\n\n{question}</s>\n<|assistant|>"""
+
+    # API setup
+    api_url = f"https://api-inference.huggingface.co/models/{model_name}"
+    headers = {
+        "Authorization": f"Bearer {hf_token}",
+        "Content-Type": "application/json"
+    }
+
+    payload = {
+        "inputs": full_prompt,
+        "parameters": {
+            "max_new_tokens": 512,
+            "return_full_text": False
+        }
+    }
+
+    # Make the request
+    response = requests.post(api_url, headers=headers, json=payload)
+
+    # Handle response
+    if response.status_code == 200:
+        return response.json()[0]["generated_text"]
+    else:
+        return f"Error {response.status_code}: {response.text}"
+
+# ========================
 # Workflow Integration
 # ========================
 
@@ -573,6 +645,10 @@ def run_pipeline(
             clips_dir
         )
 
+        # Step 7: Transcribe clips
+        transcripts_dir = os.path.join(output_base, "transcripts")
+        transcripts = transcribe_clips(clip_paths, transcripts_dir, device=device)
+
         # Generate visualizations
         plt.figure(figsize=(12, 6))
 
@@ -622,18 +698,29 @@ def run_pipeline(
             f"✅ Pipeline complete! Primary speaker: {primary_speaker}",
             plot_path,
             matched_images,
-            output_files
+            output_files,
+            transcripts
         )
 
     except Exception as e:
         import traceback
         traceback.print_exc()
-        return f"❌ Pipeline failed: {str(e)}", None, [], []
+        return f"❌ Pipeline failed: {str(e)}", None, [], [], {}
+
+def chat_with_transcripts(question, transcripts, hf_token):
+    """Handle chat interactions with the transcripts"""
+    if not transcripts:
+        return "Please run the pipeline first to generate transcripts."
+
+    return ask_question(transcripts, question, hf_token)
 
 # Gradio UI
 with gr.Blocks(theme=gr.themes.Soft()) as app:
-    gr.Markdown("# 🎥 Video Analysis Pipeline with SyncNet")
+    gr.Markdown("# 🎥 SpeakSeek")
     gr.Markdown("Identify speakers using face recognition, lip motion, and audio-visual sync")
+
+    # Store transcripts in session state
+    transcripts = gr.State({})
 
     with gr.Row():
         with gr.Column():
@@ -659,10 +746,32 @@ with gr.Blocks(theme=gr.themes.Soft()) as app:
             with gr.Accordion("Output Files", open=True):
                 clip_outputs = gr.Files(label="Results")
 
+    # Chat interface
+    with gr.Row():
+        with gr.Column():
+            chatbot = gr.Chatbot(label="Ask about the video clips")
+            question_input = gr.Textbox(label="Your question", placeholder="Where does the speaker talk about...?")
+            ask_btn = gr.Button("Ask", variant="secondary")
+
+    # Pipeline execution
     run_btn.click(
         fn=run_pipeline,
         inputs=[video_input, reference_image, hf_token, pyannotate_token, repo_id, device_selector],
-        outputs=[status_output, plot_output, image_gallery, clip_outputs]
+        outputs=[status_output, plot_output, image_gallery, clip_outputs, transcripts]
+    )
+
+    # Chat interaction
+    ask_btn.click(
+        fn=chat_with_transcripts,
+        inputs=[question_input, transcripts, hf_token],
+        outputs=[chatbot]
+    )
+
+    # Allow submitting question with Enter key
+    question_input.submit(
+        fn=chat_with_transcripts,
+        inputs=[question_input, transcripts, hf_token],
+        outputs=[chatbot]
     )
 
 if __name__ == "__main__":
